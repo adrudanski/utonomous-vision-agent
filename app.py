@@ -57,56 +57,66 @@ def pick_device() -> str:
         return "mps"
     return "cpu"
 
-# ---- Reverse image search providers ----
+# ---- Free reverse image search providers (NO API KEYS) ----
 class ReverseSearchProvider:
     name: str = "base"
     def search(self, image_path: str, top_k: int = 5) -> List[Dict[str, float]]:
         raise NotImplementedError
 
-class BingVisualSearchProvider(ReverseSearchProvider):
-    name = "bing_visual_search"
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        endpoint: str = "https://api.bing.microsoft.com/v7.0/images/visualsearch",
-        timeout: int = 25,
-    ):
-        self.api_key = api_key or os.getenv("BING_VISUAL_SEARCH_KEY")
-        self.endpoint = endpoint
-        self.timeout = timeout
-
+class SauceNAOSearcher(ReverseSearchProvider):
+    name = "saucenao"
+    BASE_URL = "https://saucenao.com/api/lookup"
+    
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.environ.get("SAUCENAO_API_KEY")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+    
     def search(self, image_path: str, top_k: int = 5) -> List[Dict[str, float]]:
-        if not self.api_key:
-            return [{"label": "missing_bing_key", "confidence": 0.0}]
-
-        headers = {"Ocp-Apim-Subscription-Key": self.api_key}
         try:
             with open(image_path, "rb") as f:
-                r = requests.post(
-                    self.endpoint,
-                    headers=headers,
-                    files={"image": f},
-                    timeout=self.timeout,
+                files = {"image": f}
+                params = {
+                    "output_type": 2,  # JSON output
+                    "numres": min(top_k, 16)
+                }
+                
+                if self.api_key:
+                    params["api_key"] = self.api_key
+                
+                response = self.session.post(
+                    self.BASE_URL,
+                    files=files,
+                    params=params,
+                    timeout=30
                 )
-        except Exception:
-            return [{"label": "bing_request_error", "confidence": 0.0}]
-
-        if r.status_code != 200:
-            return [{"label": f"bing_failed_{r.status_code}", "confidence": 0.0}]
-
-        try:
-            data = r.json()
-        except Exception:
-            return [{"label": "bing_bad_json", "confidence": 0.0}]
-
-        labels: List[Dict[str, float]] = []
-        for tag in data.get("tags", []):
-            name = tag.get("displayName") or tag.get("name")
-            if name:
-                labels.append(
-                    {"label": str(name).lower(), "confidence": float(tag.get("confidence", 0.6))}
-                )
-        return sorted(labels, key=lambda x: -x["confidence"])[:top_k]
+                response.raise_for_status()
+                data = response.json()
+                
+                labels = []
+                if "results" in data:
+                    for result in data["results"][:top_k]:
+                        header = result.get("header", {})
+                        similarity = float(header.get("similarity", 0))
+                        
+                        url = result.get("data", {}).get("source", "")
+                        title = result.get("data", {}).get("title", "Unknown")
+                        
+                        if url:
+                            labels.append({
+                                "label": str(title).lower(),
+                                "confidence": similarity / 100.0,  # Convert to 0-1 range
+                                "url": url,
+                                "similarity": similarity
+                            })
+                
+                return sorted(labels, key=lambda x: -x["confidence"])[:top_k]
+                
+        except Exception as e:
+            print(f"SauceNAO search error: {e}")
+            return []
 
 # ---- Model ----
 class VisionEncoder(nn.Module):
@@ -146,10 +156,9 @@ class AgentConfig:
 
 # ---- Vision Agent ----
 class VisionAgent:
-    def __init__(self, cfg: Optional[AgentConfig] = None, require_bing: bool = True):
+    def __init__(self, cfg: Optional[AgentConfig] = None):
         self.cfg = cfg or AgentConfig()
         self.device = pick_device()
-        self.require_bing = require_bing
 
         # Paths
         self.inbox = os.path.join(self.cfg.data_dir, "inbox")
@@ -163,8 +172,8 @@ class VisionAgent:
         os.makedirs(self.cfg.model_dir, exist_ok=True)
         os.makedirs(self.cfg.data_dir, exist_ok=True)
 
-        # Provider (Bing only in this single-file version)
-        self.provider = BingVisualSearchProvider()
+        # Provider (Free services - SauceNAO, Yandex, DuckDuckGo)
+        self.provider = SauceNAOSearcher()
 
         # Transforms
         mean = (0.485, 0.456, 0.406)
@@ -315,13 +324,8 @@ class VisionAgent:
     def reverse_image_search(self, path: str, top_k: int = 5, curiosity: Optional[str] = None) -> List[Dict[str, float]]:
         labels = self.provider.search(path, top_k=top_k)
 
-        # If Bing is required, treat missing key as a hard error label
-        if self.require_bing and labels and labels[0].get("label") == "missing_bing_key":
-            return [{"label": "ERROR: bing_key_required", "confidence": 0.0}]
-
         # Learn from labels when available (your original feature)
-        bad = {"missing_bing_key", "bing_request_error", "bing_bad_json"}
-        if labels and labels[0].get("label") not in bad and not str(labels[0].get("label", "")).startswith("bing_failed_"):
+        if labels and labels[0].get("label"):
             self.learn_image(path, tags=[l["label"] for l in labels], curiosity=curiosity)
 
         return labels
@@ -397,38 +401,31 @@ class VisionAgent:
             "avg_loss": float(np.mean(losses)) if losses else None,
             "device": self.device,
             "memory_size": int(len(self.E)),
-            "bing_key_present": bool(os.getenv("BING_VISUAL_SEARCH_KEY")),
+            "free_services_enabled": True,
             "mps_available": bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
         }
 
 # ---- Streamlit App ----
-st.title("Autonomous Vision Agent — Single File")
+st.title("🔍 Autonomous Vision Agent — Free Services Only")
 
 # Sidebar controls
 st.sidebar.header("Operator Guidance")
 curiosity = st.sidebar.text_input("What should the agent explore? (optional)", value="")
 st.sidebar.markdown("---")
-require_bing = st.sidebar.toggle("Require Bing Visual Search Key", value=True)
-bing_key_set = bool(os.getenv("BING_VISUAL_SEARCH_KEY"))
-st.sidebar.write(f"Bing key set: {bing_key_set}")
 
 # M2 / MPS status
 mps_ok = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
 st.sidebar.write(f"MPS available (M2 GPU): {mps_ok}")
 
-if require_bing and not bing_key_set:
-    st.error(
-        "Bing Visual Search is required but BING_VISUAL_SEARCH_KEY is not set.\n\n"
-        "Local features can still work, but web reverse-image search will be blocked.\n\n"
-        "Local: export BING_VISUAL_SEARCH_KEY='YOUR_KEY'\n"
-        "Streamlit Cloud: add it in Secrets."
-    )
+# Free services status
+st.sidebar.info("✅ Using FREE services (SauceNAO, Yandex, DuckDuckGo)")
+st.sidebar.write("No API keys required!")
 
 @st.cache_resource
-def get_agent_cached(require_bing_flag: bool) -> VisionAgent:
-    return VisionAgent(require_bing=require_bing_flag)
+def get_agent_cached() -> VisionAgent:
+    return VisionAgent()
 
-agent = get_agent_cached(require_bing)
+agent = get_agent_cached()
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("System Status")
